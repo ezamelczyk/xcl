@@ -5548,14 +5548,14 @@ fn float_minmax_mem(min: bool, x2: bool, a: &str, v: &str, old: &str, t: &str) -
 const MEM_ACCESSORS_HERE: &str = "//XCL_MEM_ACCESSORS\n";
 
 /// Four dwords at four addresses (scalar buffer loads with their bounds checks); with several
-/// windows `mem_accessors` defines it, with one switch for all four.
+/// windows `mem_accessors` defines it, with one window choice for all four.
 const LOADX4_ONE_WINDOW: &str = "uint4 xcl_loadx4(uint4 a) { return uint4(mem.Load(a.x), mem.Load(a.y), mem.Load(a.z), mem.Load(a.w)); }\n";
 
 /// Several memory windows: every `mem.Method(` of the program (and of the preludes) becomes
-/// an accessor `xcl_mMethod(` that switches on `xcl_w` between `mem` and `mem1`.., whose
+/// an accessor `xcl_mMethod(` that picks `mem`, `mem1`.. by `xcl_w`, whose
 /// definitions replace the placeholder.
 /// `heap`: Some(storage class) – the accessors take window k from the descriptor heap
-/// (`Options::heap_windows`) instead of switching over the root UAVs.
+/// (`Options::heap_windows`) instead of branching over the root UAVs.
 fn windowed(h: &str, windows: u32, heap: Option<&str>) -> String {
     let mut out = String::with_capacity(h.len() + 8192);
     let mut rest = h;
@@ -5578,8 +5578,8 @@ fn windowed(h: &str, windows: u32, heap: Option<&str>) -> String {
 }
 
 /// The accessor functions: one per `mem` method (and overload) the translator emits.
-/// Only explicit windows `0..windows` touch GPU buffers; any out-of-range `xcl_w` hits
-/// `default` (reads return 0, stores/atomics are dropped and zero their `out` parameter) so
+/// Only explicit windows `0..windows` touch GPU buffers; any out-of-range `xcl_w` gets the
+/// default (reads return 0, stores/atomics are dropped and zero their `out` parameter) so
 /// out-of-UMA pointers can never wrap onto live memory windows.
 /// `heap`: Some(storage class) – window k is taken from the descriptor heap
 /// (`Options::heap_windows`) and the same rule is one comparison before the access.
@@ -5621,26 +5621,38 @@ fn mem_accessors(windows: u32, heap: Option<&str>) -> String {
         }
         return s;
     }
-    let _ = write!(s, "uint4 xcl_loadx4(uint4 a) {{ [branch] switch (xcl_w) {{ ");
-    let _ = write!(s, "case 0u: return uint4(mem.Load(a.x), mem.Load(a.y), mem.Load(a.z), mem.Load(a.w)); ");
-    for k in 1..windows {
-        let _ = write!(s, "case {k}u: return uint4(mem{k}.Load(a.x), mem{k}.Load(a.y), mem{k}.Load(a.z), mem{k}.Load(a.w)); ");
+    // One `if` per window, each from a defined value, not a `switch`: Mesa's SPIR-V frontend
+    // lowers a switch to a chain of ifs with a path on which no case runs, so every accessor
+    // result inside a loop became a loop-carried value (RADV: thousands of live SGPRs, tens of
+    // GB and minutes for one compute pipeline). `xcl_w` outside the windows keeps the default.
+    // The ifs test bits of a one-hot mask, not `xcl_w == k`: DXC's jump threading correlates
+    // equality tests of one value and took most of the compile (47 s instead of 20 for a big CS).
+    let win = |k: u32| if k == 0 { "mem".to_string() } else { format!("mem{k}") };
+    let mask = format!("uint wm = select(xcl_w < {windows}u, 1u << xcl_w, 0u); ");
+    let on = |k: u32| format!("[branch] if ((wm & {}u) != 0u)", 1u32 << k);
+    let _ = write!(s, "uint4 xcl_loadx4(uint4 a) {{ {mask}uint4 r = uint4(0u, 0u, 0u, 0u); ");
+    for k in 0..windows {
+        let m = win(k);
+        let _ = write!(s, "{} {{ r = uint4({m}.Load(a.x), {m}.Load(a.y), {m}.Load(a.z), {m}.Load(a.w)); }} ", on(k));
     }
-    let _ = writeln!(s, "default: return uint4(0u, 0u, 0u, 0u); }} }}");
+    let _ = writeln!(s, "return r; }}");
     for (ret, name, params, args, def) in sigs {
-        let _ = write!(s, "{ret} xcl_m{name}({params}) {{ [branch] switch (xcl_w) {{ ");
+        let _ = write!(s, "{ret} xcl_m{name}({params}) {{ {mask}");
         if ret == "void" {
-            let _ = write!(s, "case 0u: mem.{name}({args}); break; ");
-            for k in 1..windows {
-                let _ = write!(s, "case {k}u: mem{k}.{name}({args}); break; ");
+            // the default zeroes the `out` parameter (`o = …; break;`)
+            let _ = write!(s, "{}", def.replace("break;", ""));
+            for k in 0..windows {
+                let _ = write!(s, "{} {{ {}.{name}({args}); }} ", on(k), win(k));
             }
         } else {
-            let _ = write!(s, "case 0u: return mem.{name}({args}); ");
-            for k in 1..windows {
-                let _ = write!(s, "case {k}u: return mem{k}.{name}({args}); ");
+            let zero = def.trim_start_matches("return ").trim_end_matches(';');
+            let _ = write!(s, "{ret} r = {zero}; ");
+            for k in 0..windows {
+                let _ = write!(s, "{} {{ r = {}.{name}({args}); }} ", on(k), win(k));
             }
+            let _ = write!(s, "return r; ");
         }
-        let _ = writeln!(s, "default: {def} }} }}");
+        let _ = writeln!(s, "}}");
     }
     s
 }
